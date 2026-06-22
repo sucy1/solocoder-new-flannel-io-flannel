@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -27,12 +28,12 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"encoding/json"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/coreos/pkg/flagutil"
+	"github.com/flannel-io/flannel/pkg/backend"
 	"github.com/flannel-io/flannel/pkg/ip"
 	"github.com/flannel-io/flannel/pkg/ipmatch"
 	"github.com/flannel-io/flannel/pkg/lease"
@@ -46,9 +47,6 @@ import (
 	"github.com/joho/godotenv"
 	log "k8s.io/klog/v2"
 
-	// Backends need to be imported for their init() to get executed and them to register
-	"github.com/coreos/go-systemd/v22/daemon"
-	"github.com/flannel-io/flannel/pkg/backend"
 	_ "github.com/flannel-io/flannel/pkg/backend/alloc"
 	_ "github.com/flannel-io/flannel/pkg/backend/extension"
 	_ "github.com/flannel-io/flannel/pkg/backend/hostgw"
@@ -58,6 +56,9 @@ import (
 	_ "github.com/flannel-io/flannel/pkg/backend/udp"
 	_ "github.com/flannel-io/flannel/pkg/backend/vxlan"
 	_ "github.com/flannel-io/flannel/pkg/backend/wireguard"
+
+	"github.com/coreos/go-systemd/v22/daemon"
+	"github.com/vishvananda/netlink"
 )
 
 type flagSlice []string
@@ -110,16 +111,27 @@ var (
 	healthzState   = &HealthzState{}
 )
 
+type HealthCheckResult struct {
+	OK      bool   `json:"ok"`
+	Message string `json:"message,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
 type HealthzState struct {
-	mu          sync.RWMutex
-	BackendType string
-	Network     string
-	Subnet      string
-	IPv6Subnet  string
-	MTU         int
-	PublicIP    string
-	PublicIPv6  string
-	LeaseExpiry string
+	mu            sync.RWMutex
+	Sm            subnet.Manager
+	Bn            backend.Network
+	Config        *subnet.Config
+	BackendType   string
+	Network       string
+	Subnet        string
+	IPv6Subnet    string
+	MTU           int
+	PublicIP      string
+	PublicIPv6    string
+	LeaseExpiry   string
+	ExtIfaceName  string
+	ExtIfaceIndex int
 }
 
 func init() {
@@ -266,6 +278,10 @@ func main() {
 	}
 	log.Infof("Created subnet manager: %s", sm.Name())
 
+	healthzState.mu.Lock()
+	healthzState.Sm = sm
+	healthzState.mu.Unlock()
+
 	// Register for SIGINT and SIGTERM
 	log.Info("Installing signal handlers")
 	sigs := make(chan os.Signal, 1)
@@ -403,6 +419,11 @@ func main() {
 	healthzState.BackendType = config.BackendType
 	healthzState.Network = config.Network.String()
 	healthzState.MTU = bn.MTU()
+	healthzState.Sm = sm
+	healthzState.Bn = bn
+	healthzState.Config = config
+	healthzState.ExtIfaceName = extIface.Iface.Name
+	healthzState.ExtIfaceIndex = extIface.Iface.Index
 	if bn.Lease() != nil {
 		healthzState.Subnet = bn.Lease().Subnet.String()
 		healthzState.IPv6Subnet = bn.Lease().IPv6Subnet.String()
@@ -577,6 +598,82 @@ func getConfig(ctx context.Context, sm subnet.Manager) (*subnet.Config, error) {
 	}
 }
 
+func checkEtcdConnectivity(ctx context.Context, sm subnet.Manager) HealthCheckResult {
+	if sm == nil {
+		return HealthCheckResult{OK: false, Error: "subnet manager not initialized"}
+	}
+
+	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	if _, err := sm.GetNetworkConfig(checkCtx); err != nil {
+		return HealthCheckResult{OK: false, Error: err.Error()}
+	}
+
+	return HealthCheckResult{OK: true, Message: "etcd connection healthy"}
+}
+
+func checkNetworkInterface(ifaceName string) HealthCheckResult {
+	if ifaceName == "" {
+		return HealthCheckResult{OK: false, Error: "external interface not set"}
+	}
+
+	link, err := netlink.LinkByName(ifaceName)
+	if err != nil {
+		return HealthCheckResult{OK: false, Error: fmt.Sprintf("interface %q not found: %v", ifaceName, err)}
+	}
+
+	attrs := link.Attrs()
+	if attrs.Flags&net.FlagUp == 0 {
+		return HealthCheckResult{OK: false, Error: fmt.Sprintf("interface %q is not UP", ifaceName)}
+	}
+
+	return HealthCheckResult{OK: true, Message: fmt.Sprintf("interface %q is UP (index %d, MTU %d)", ifaceName, attrs.Index, attrs.MTU)}
+}
+
+func checkRoutingTable(network, ipv6Network, ifaceName string, ifaceIndex int) HealthCheckResult {
+	foundAny := false
+	var errors []string
+
+	if network != "" {
+		_, ipnet, err := net.ParseCIDR(network)
+		if err == nil {
+			routes, rerr := netlink.RouteListFiltered(netlink.FAMILY_V4, &netlink.Route{Dst: ipnet}, netlink.RT_FILTER_DST)
+			if rerr != nil {
+				errors = append(errors, fmt.Sprintf("IPv4 route lookup failed: %v", rerr))
+			} else if len(routes) == 0 {
+				errors = append(errors, fmt.Sprintf("IPv4 route for %s not found in routing table", network))
+			} else {
+				foundAny = true
+			}
+		}
+	}
+
+	if ipv6Network != "" {
+		_, ipnet, err := net.ParseCIDR(ipv6Network)
+		if err == nil {
+			routes, rerr := netlink.RouteListFiltered(netlink.FAMILY_V6, &netlink.Route{Dst: ipnet}, netlink.RT_FILTER_DST)
+			if rerr != nil {
+				errors = append(errors, fmt.Sprintf("IPv6 route lookup failed: %v", rerr))
+			} else if len(routes) == 0 {
+				errors = append(errors, fmt.Sprintf("IPv6 route for %s not found in routing table", ipv6Network))
+			} else {
+				foundAny = true
+			}
+		}
+	}
+
+	if foundAny {
+		return HealthCheckResult{OK: true, Message: "flannel routes present in routing table"}
+	}
+
+	if len(errors) > 0 {
+		return HealthCheckResult{OK: false, Error: strings.Join(errors, "; ")}
+	}
+
+	return HealthCheckResult{OK: true, Message: "no flannel routes to check (network not configured yet)"}
+}
+
 func mustRunHealthz(stopChan <-chan struct{}, wg *sync.WaitGroup) {
 	address := net.JoinHostPort(opts.healthzIP, strconv.Itoa(opts.healthzPort))
 	log.Infof("Start healthz server on %s", address)
@@ -584,16 +681,24 @@ func mustRunHealthz(stopChan <-chan struct{}, wg *sync.WaitGroup) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		healthzState.mu.RLock()
+		sm := healthzState.Sm
+		bn := healthzState.Bn
+		config := healthzState.Config
+		extIfaceName := healthzState.ExtIfaceName
+		extIfaceIndex := healthzState.ExtIfaceIndex
 		state := struct {
-			Status      string `json:"status"`
-			BackendType string `json:"backendType,omitempty"`
-			Network     string `json:"network,omitempty"`
-			Subnet      string `json:"subnet,omitempty"`
-			IPv6Subnet  string `json:"ipv6Subnet,omitempty"`
-			MTU         int    `json:"mtu,omitempty"`
-			PublicIP    string `json:"publicIP,omitempty"`
-			PublicIPv6  string `json:"publicIPv6,omitempty"`
-			LeaseExpiry string `json:"leaseExpiry,omitempty"`
+			Status        string              `json:"status"`
+			BackendType   string              `json:"backendType,omitempty"`
+			Network       string              `json:"network,omitempty"`
+			Subnet        string              `json:"subnet,omitempty"`
+			IPv6Subnet    string              `json:"ipv6Subnet,omitempty"`
+			MTU           int                 `json:"mtu,omitempty"`
+			PublicIP      string              `json:"publicIP,omitempty"`
+			PublicIPv6    string              `json:"publicIPv6,omitempty"`
+			LeaseExpiry   string              `json:"leaseExpiry,omitempty"`
+			EtcdHealth    HealthCheckResult   `json:"etcdHealth"`
+			IfaceHealth   HealthCheckResult   `json:"interfaceHealth"`
+			RoutingHealth HealthCheckResult   `json:"routingHealth"`
 		}{
 			Status:      "running",
 			BackendType: healthzState.BackendType,
@@ -607,8 +712,38 @@ func mustRunHealthz(stopChan <-chan struct{}, wg *sync.WaitGroup) {
 		}
 		healthzState.mu.RUnlock()
 
+		state.EtcdHealth = checkEtcdConnectivity(r.Context(), sm)
+
+		if extIfaceName != "" {
+			state.IfaceHealth = checkNetworkInterface(extIfaceName)
+		} else {
+			state.IfaceHealth = HealthCheckResult{OK: false, Error: "external interface not yet initialized"}
+		}
+
+		var networkStr, ipv6NetworkStr string
+		if config != nil {
+			if config.Network != (ip.IP4Net{}) {
+				networkStr = config.Network.String()
+			}
+			if !config.IPv6Network.Empty() {
+				ipv6NetworkStr = config.IPv6Network.String()
+			}
+		}
+		state.RoutingHealth = checkRoutingTable(networkStr, ipv6NetworkStr, extIfaceName, extIfaceIndex)
+
+		overallOK := state.EtcdHealth.OK && state.IfaceHealth.OK && state.RoutingHealth.OK
+		if overallOK {
+			state.Status = "healthy"
+		} else {
+			state.Status = "degraded"
+		}
+
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
+		if !overallOK {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		} else {
+			w.WriteHeader(http.StatusOK)
+		}
 		if err := json.NewEncoder(w).Encode(state); err != nil {
 			log.Errorf("Handling /healthz error. %v", err)
 		}

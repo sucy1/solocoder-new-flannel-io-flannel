@@ -151,25 +151,32 @@ func (m *LocalManager) tryAcquireLease(ctx context.Context, config *subnet.Confi
 		return nil, err
 	}
 
-	// Try to reuse a subnet if there's one that matches our IP
+	now := time.Now()
+
 	if l := findLeaseByIP(leases, extIaddr); l != nil {
-		// Make sure the existing subnet is still within the configured network
 		if isSubnetConfigCompat(config, l.Subnet) && isIPv6SubnetConfigCompat(config, l.IPv6Subnet) {
-			log.Infof("Found lease (ip: %v ipv6: %v) for current IP (%v), reusing", l.Subnet, l.IPv6Subnet, extIaddr)
+			if !l.Expiration.IsZero() && l.Expiration.Before(now) {
+				log.Warningf("Found expired lease (ip: %v ipv6: %v) for current IP (%v), deleting before reusing", l.Subnet, l.IPv6Subnet, extIaddr)
+				if err := m.registry.deleteSubnet(ctx, l.Subnet, l.IPv6Subnet); err != nil {
+					return nil, err
+				}
+				time.Sleep(200 * time.Millisecond)
+			} else {
+				log.Infof("Found lease (ip: %v ipv6: %v) for current IP (%v), reusing", l.Subnet, l.IPv6Subnet, extIaddr)
 
-			ttl := time.Duration(0)
-			if !l.Expiration.IsZero() {
-				// Not a reservation
-				ttl = subnetTTL
-			}
-			exp, err := m.registry.updateSubnet(ctx, l.Subnet, l.IPv6Subnet, attrs, ttl, 0)
-			if err != nil {
-				return nil, err
-			}
+				ttl := time.Duration(0)
+				if !l.Expiration.IsZero() {
+					ttl = subnetTTL
+				}
+				exp, err := m.registry.updateSubnet(ctx, l.Subnet, l.IPv6Subnet, attrs, ttl, 0)
+				if err != nil {
+					return nil, err
+				}
 
-			l.Attrs = *attrs
-			l.Expiration = exp
-			return l, nil
+				l.Attrs = *attrs
+				l.Expiration = exp
+				return l, nil
+			}
 		} else {
 			log.Infof("Found lease (%+v) for current IP (%v) but not compatible with current config, deleting", l, extIaddr)
 			if err := m.registry.deleteSubnet(ctx, l.Subnet, l.IPv6Subnet); err != nil {
@@ -178,13 +185,10 @@ func (m *LocalManager) tryAcquireLease(ctx context.Context, config *subnet.Confi
 		}
 	}
 
-	// no existing match, check if there was a previous subnet to use
 	var sn ip.IP4Net
 	var sn6 ip.IP6Net
 	if !m.previousSubnet.Empty() {
-		// use previous subnet
 		if l := findLeaseBySubnet(leases, m.previousSubnet); l == nil {
-			// Check if the previous subnet is a part of the network and of the right subnet length
 			if isSubnetConfigCompat(config, m.previousSubnet) && isIPv6SubnetConfigCompat(config, m.previousIPv6Subnet) {
 				log.Infof("Found previously leased subnet (%v), reusing", m.previousSubnet)
 				sn = m.previousSubnet
@@ -192,11 +196,20 @@ func (m *LocalManager) tryAcquireLease(ctx context.Context, config *subnet.Confi
 			} else {
 				log.Errorf("Found previously leased subnet (%v) that is not compatible with the Etcd network config, ignoring", m.previousSubnet)
 			}
+		} else if !l.Expiration.IsZero() && l.Expiration.Before(now) {
+			log.Warningf("Found expired previous subnet (%v), deleting before reusing", m.previousSubnet)
+			if err := m.registry.deleteSubnet(ctx, m.previousSubnet, m.previousIPv6Subnet); err != nil {
+				return nil, err
+			}
+			time.Sleep(200 * time.Millisecond)
+			if isSubnetConfigCompat(config, m.previousSubnet) && isIPv6SubnetConfigCompat(config, m.previousIPv6Subnet) {
+				sn = m.previousSubnet
+				sn6 = m.previousIPv6Subnet
+			}
 		}
 	}
 
 	if sn.Empty() {
-		// no existing match, grab a new one
 		sn, sn6, err = m.allocateSubnet(config, leases)
 		if err != nil {
 			return nil, err
@@ -230,6 +243,7 @@ func (m *LocalManager) allocateSubnet(config *subnet.Config, leases []lease.Leas
 
 	var availableIPs []ip.IP4
 	var availableIPv6s []*ip.IP6
+	now := time.Now()
 
 	sn := ip.IP4Net{IP: config.SubnetMin, PrefixLen: config.SubnetLen}
 	var sn6 ip.IP6Net
@@ -241,6 +255,10 @@ OuterLoop:
 	for ; sn.IP <= config.SubnetMax && len(availableIPs) < 100; sn = sn.Next() {
 		for _, l := range leases {
 			if sn.Overlaps(l.Subnet) {
+				if !l.Expiration.IsZero() && l.Expiration.Before(now) {
+					log.V(2).Infof("Ignoring expired lease %v (expired at %v)", l.Subnet, l.Expiration)
+					continue
+				}
 				continue OuterLoop
 			}
 		}
@@ -252,6 +270,10 @@ OuterLoop:
 		for ; sn6.IP.Cmp(config.IPv6SubnetMax) <= 0 && len(availableIPv6s) < 100; sn6 = sn6.Next() {
 			for _, l := range leases {
 				if sn6.Overlaps(l.IPv6Subnet) {
+					if !l.Expiration.IsZero() && l.Expiration.Before(now) {
+						log.V(2).Infof("Ignoring expired IPv6 lease %v (expired at %v)", l.IPv6Subnet, l.Expiration)
+						continue
+					}
 					continue OuterLoopv6
 				}
 			}
@@ -388,6 +410,8 @@ func (m *LocalManager) CompleteLease(ctx context.Context, myLease *lease.Lease, 
 						log.Errorf("Failed to release expired lease: %v", rerr)
 					}
 
+					time.Sleep(500 * time.Millisecond)
+
 					newLease, aerr := m.AcquireLease(ctx, &myLease.Attrs)
 					if aerr != nil {
 						log.Errorf("Failed to re-acquire lease: %v", aerr)
@@ -424,6 +448,9 @@ func (m *LocalManager) CompleteLease(ctx context.Context, myLease *lease.Lease, 
 			case lease.EventRemoved:
 				log.Warning("Lease has been revoked, attempting to release and re-acquire")
 				_ = m.registry.deleteSubnet(ctx, myLease.Subnet, myLease.IPv6Subnet)
+
+				time.Sleep(500 * time.Millisecond)
+
 				newLease, aerr := m.AcquireLease(ctx, &myLease.Attrs)
 				if aerr != nil {
 					log.Errorf("Failed to re-acquire lease after revocation: %v", aerr)
@@ -467,6 +494,10 @@ func (m *LocalManager) Name() string {
 		previousSubnet = "None"
 	}
 	return fmt.Sprintf("Etcd Local Manager with Previous Subnet: %s", previousSubnet)
+}
+
+func (m *LocalManager) getLeasesSnapshot(ctx context.Context) ([]lease.Lease, int64, error) {
+	return m.registry.getSubnets(ctx)
 }
 
 // For etcd subnet manager, the file never changes so we just write it once at startup

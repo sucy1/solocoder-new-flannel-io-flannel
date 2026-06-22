@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/flannel-io/flannel/pkg/backend"
 	"github.com/flannel-io/flannel/pkg/ip"
@@ -88,15 +89,98 @@ func (n *network) Run(ctx context.Context) {
 
 	defer wg.Wait()
 
+	cleanupTicker := time.NewTicker(5 * time.Minute)
+	defer cleanupTicker.Stop()
+
 	for {
 		select {
 		case evtBatch := <-events:
 			n.handleSubnetEvents(ctx, evtBatch)
 
+		case <-cleanupTicker.C:
+			n.cleanupStalePeers(ctx)
+
 		case <-ctx.Done():
 			return
 		}
 	}
+}
+
+func (n *network) cleanupStalePeers(ctx context.Context) {
+	if n.dev == nil {
+		return
+	}
+
+	leases, _, err := n.sm.(subnetWatchLeasesGetter).getLeasesSnapshot(ctx)
+	if err != nil {
+		log.Warningf("Failed to get leases snapshot for peer cleanup: %v", err)
+		return
+	}
+
+	validSubnets := make(map[string]bool)
+	for _, l := range leases {
+		if l.EnableIPv4 {
+			validSubnets[l.Subnet.String()] = true
+		}
+		if l.EnableIPv6 {
+			validSubnets[l.IPv6Subnet.String()] = true
+		}
+	}
+
+	validSubnets[n.lease.Subnet.String()] = true
+	if !n.lease.IPv6Subnet.Empty() {
+		validSubnets[n.lease.IPv6Subnet.String()] = true
+	}
+
+	peers, err := n.dev.listPeers()
+	if err != nil {
+		log.Warningf("Failed to list wireguard peers for cleanup: %v", err)
+		return
+	}
+
+	for pubKey, allowedIPs := range peers {
+		stillValid := false
+		for _, ipnet := range allowedIPs {
+			if validSubnets[ipnet.String()] {
+				stillValid = true
+				break
+			}
+		}
+		if !stillValid {
+			log.Infof("Cleaning up stale wireguard peer %v (allowed IPs: %v)", pubKey.String()[:12]+"...", allowedIPs)
+			if err := n.dev.removePeer(pubKey.String()); err != nil {
+				log.Errorf("Failed to remove stale wireguard peer: %v", err)
+			}
+		}
+	}
+
+	if n.v6Dev != nil {
+		v6Peers, err := n.v6Dev.listPeers()
+		if err != nil {
+			log.Warningf("Failed to list v6 wireguard peers for cleanup: %v", err)
+			return
+		}
+
+		for pubKey, allowedIPs := range v6Peers {
+			stillValid := false
+			for _, ipnet := range allowedIPs {
+				if validSubnets[ipnet.String()] {
+					stillValid = true
+					break
+				}
+			}
+			if !stillValid {
+				log.Infof("Cleaning up stale v6 wireguard peer %v (allowed IPs: %v)", pubKey.String()[:12]+"...", allowedIPs)
+				if err := n.v6Dev.removePeer(pubKey.String()); err != nil {
+					log.Errorf("Failed to remove stale v6 wireguard peer: %v", err)
+				}
+			}
+		}
+	}
+}
+
+type subnetWatchLeasesGetter interface {
+	getLeasesSnapshot(ctx context.Context) ([]lease.Lease, int64, error)
 }
 
 type wireguardLeaseAttrs struct {
@@ -181,7 +265,7 @@ func (n *network) handleSubnetEvents(ctx context.Context, batch []lease.Event) {
 			if n.mode == Separate {
 				if event.Lease.EnableIPv4 {
 					log.Infof("Subnet added: %v via %v", event.Lease.Subnet, v4PeerEndpoint)
-					if err := n.dev.addPeer(
+					if err := n.dev.swapPeer(
 						v4PeerEndpoint,
 						v4wireguardAttrs.PublicKey,
 						[]net.IPNet{*event.Lease.Subnet.ToIPNet()}); err != nil {
@@ -199,7 +283,7 @@ func (n *network) handleSubnetEvents(ctx context.Context, batch []lease.Event) {
 
 				if event.Lease.EnableIPv6 {
 					log.Infof("Subnet added: %v via %v", event.Lease.IPv6Subnet, v6PeerEndpoint)
-					if err := n.v6Dev.addPeer(
+					if err := n.v6Dev.swapPeer(
 						v6PeerEndpoint,
 						v6wireguardAttrs.PublicKey,
 						[]net.IPNet{*event.Lease.IPv6Subnet.ToIPNet()}); err != nil {
@@ -217,7 +301,7 @@ func (n *network) handleSubnetEvents(ctx context.Context, batch []lease.Event) {
 			} else {
 				var publicEndpoint string
 				mode := n.mode
-				if mode != Ipv4 && mode != Ipv6 { // Auto mode
+				if mode != Ipv4 && mode != Ipv6 {
 					mode = n.selectMode(event.Lease.Attrs.PublicIP, event.Lease.Attrs.PublicIPv6)
 				}
 				switch mode {
@@ -232,7 +316,7 @@ func (n *network) handleSubnetEvents(ctx context.Context, batch []lease.Event) {
 				for _, v := range subnets {
 					peers = append(peers, *v)
 				}
-				if err := n.dev.addPeer(
+				if err := n.dev.swapPeer(
 					publicEndpoint,
 					wireguardAttrs.PublicKey,
 					peers); err != nil {
