@@ -58,6 +58,13 @@ func isErrEtcdNodeExist(e error) bool {
 	return e == rpctypes.ErrDuplicateKey
 }
 
+func isErrEtcdNodeNotFound(e error) bool {
+	if e == nil {
+		return false
+	}
+	return e == rpctypes.ErrGRPCKeyNotFound
+}
+
 func (c watchCursor) String() string {
 	return strconv.FormatInt(c.index, 10)
 }
@@ -188,20 +195,32 @@ func (m *LocalManager) tryAcquireLease(ctx context.Context, config *subnet.Confi
 	var sn ip.IP4Net
 	var sn6 ip.IP6Net
 	if !m.previousSubnet.Empty() {
-		if l := findLeaseBySubnet(leases, m.previousSubnet); l == nil {
-			if isSubnetConfigCompat(config, m.previousSubnet) && isIPv6SubnetConfigCompat(config, m.previousIPv6Subnet) {
-				log.Infof("Found previously leased subnet (%v), reusing", m.previousSubnet)
-				sn = m.previousSubnet
-				sn6 = m.previousIPv6Subnet
+		cachedLease := findLeaseBySubnet(leases, m.previousSubnet)
+		if cachedLease == nil {
+			directLease, _, derr := m.registry.getSubnet(ctx, m.previousSubnet, m.previousIPv6Subnet)
+			if derr == nil && directLease != nil {
+				log.Warningf("Previous subnet %v found in etcd but not in cache, cache was stale. Not reusing.", m.previousSubnet)
+			} else if derr == nil && directLease == nil {
+				if isSubnetConfigCompat(config, m.previousSubnet) && isIPv6SubnetConfigCompat(config, m.previousIPv6Subnet) {
+					log.Infof("Found previously leased subnet (%v), verified available in etcd, reusing", m.previousSubnet)
+					sn = m.previousSubnet
+					sn6 = m.previousIPv6Subnet
+				}
+			} else if isErrEtcdNodeNotFound(derr) {
+				if isSubnetConfigCompat(config, m.previousSubnet) && isIPv6SubnetConfigCompat(config, m.previousIPv6Subnet) {
+					log.Infof("Found previously leased subnet (%v), verified available in etcd, reusing", m.previousSubnet)
+					sn = m.previousSubnet
+					sn6 = m.previousIPv6Subnet
+				}
 			} else {
-				log.Errorf("Found previously leased subnet (%v) that is not compatible with the Etcd network config, ignoring", m.previousSubnet)
+				log.Warningf("Failed to verify previous subnet %v availability in etcd: %v", m.previousSubnet, derr)
 			}
-		} else if !l.Expiration.IsZero() && l.Expiration.Before(now) {
+		} else if !cachedLease.Expiration.IsZero() && cachedLease.Expiration.Before(now) {
 			log.Warningf("Found expired previous subnet (%v), deleting before reusing", m.previousSubnet)
 			if err := m.registry.deleteSubnet(ctx, m.previousSubnet, m.previousIPv6Subnet); err != nil {
 				return nil, err
 			}
-			time.Sleep(200 * time.Millisecond)
+			time.Sleep(500 * time.Millisecond)
 			if isSubnetConfigCompat(config, m.previousSubnet) && isIPv6SubnetConfigCompat(config, m.previousIPv6Subnet) {
 				sn = m.previousSubnet
 				sn6 = m.previousIPv6Subnet

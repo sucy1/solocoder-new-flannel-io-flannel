@@ -58,7 +58,6 @@ import (
 	_ "github.com/flannel-io/flannel/pkg/backend/wireguard"
 
 	"github.com/coreos/go-systemd/v22/daemon"
-	"github.com/vishvananda/netlink"
 )
 
 type flagSlice []string
@@ -606,72 +605,40 @@ func checkEtcdConnectivity(ctx context.Context, sm subnet.Manager) HealthCheckRe
 	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	if _, err := sm.GetNetworkConfig(checkCtx); err != nil {
-		return HealthCheckResult{OK: false, Error: err.Error()}
-	}
-
-	return HealthCheckResult{OK: true, Message: "etcd connection healthy"}
-}
-
-func checkNetworkInterface(ifaceName string) HealthCheckResult {
-	if ifaceName == "" {
-		return HealthCheckResult{OK: false, Error: "external interface not set"}
-	}
-
-	link, err := netlink.LinkByName(ifaceName)
+	cfg, err := sm.GetNetworkConfig(checkCtx)
 	if err != nil {
-		return HealthCheckResult{OK: false, Error: fmt.Sprintf("interface %q not found: %v", ifaceName, err)}
+		return HealthCheckResult{OK: false, Error: fmt.Sprintf("etcd network config read failed: %v", err)}
 	}
 
-	attrs := link.Attrs()
-	if attrs.Flags&net.FlagUp == 0 {
-		return HealthCheckResult{OK: false, Error: fmt.Sprintf("interface %q is not UP", ifaceName)}
+	if cfg.Network == (ip.IP4Net{}) && cfg.IPv6Network.Empty() {
+		return HealthCheckResult{OK: false, Error: "etcd returned empty network config"}
 	}
 
-	return HealthCheckResult{OK: true, Message: fmt.Sprintf("interface %q is UP (index %d, MTU %d)", ifaceName, attrs.Index, attrs.MTU)}
+	leases, _, err := sm.(interface {
+		getLeasesSnapshot(context.Context) ([]lease.Lease, int64, error)
+	}).getLeasesSnapshot(checkCtx)
+	if err != nil {
+		return HealthCheckResult{OK: false, Error: fmt.Sprintf("etcd lease list failed: %v", err)}
+	}
+
+	return HealthCheckResult{OK: true, Message: fmt.Sprintf("etcd connection healthy (%d leases)", len(leases))}
 }
 
-func checkRoutingTable(network, ipv6Network, ifaceName string, ifaceIndex int) HealthCheckResult {
-	foundAny := false
-	var errors []string
-
-	if network != "" {
-		_, ipnet, err := net.ParseCIDR(network)
-		if err == nil {
-			routes, rerr := netlink.RouteListFiltered(netlink.FAMILY_V4, &netlink.Route{Dst: ipnet}, netlink.RT_FILTER_DST)
-			if rerr != nil {
-				errors = append(errors, fmt.Sprintf("IPv4 route lookup failed: %v", rerr))
-			} else if len(routes) == 0 {
-				errors = append(errors, fmt.Sprintf("IPv4 route for %s not found in routing table", network))
-			} else {
-				foundAny = true
-			}
-		}
+func checkLease(l *lease.Lease) HealthCheckResult {
+	if l == nil {
+		return HealthCheckResult{OK: false, Error: "no lease acquired"}
 	}
 
-	if ipv6Network != "" {
-		_, ipnet, err := net.ParseCIDR(ipv6Network)
-		if err == nil {
-			routes, rerr := netlink.RouteListFiltered(netlink.FAMILY_V6, &netlink.Route{Dst: ipnet}, netlink.RT_FILTER_DST)
-			if rerr != nil {
-				errors = append(errors, fmt.Sprintf("IPv6 route lookup failed: %v", rerr))
-			} else if len(routes) == 0 {
-				errors = append(errors, fmt.Sprintf("IPv6 route for %s not found in routing table", ipv6Network))
-			} else {
-				foundAny = true
-			}
-		}
+	if l.Expiration.IsZero() {
+		return HealthCheckResult{OK: true, Message: "lease is a reservation (no expiration)"}
 	}
 
-	if foundAny {
-		return HealthCheckResult{OK: true, Message: "flannel routes present in routing table"}
+	if time.Now().After(l.Expiration) {
+		return HealthCheckResult{OK: false, Error: fmt.Sprintf("lease expired at %v", l.Expiration)}
 	}
 
-	if len(errors) > 0 {
-		return HealthCheckResult{OK: false, Error: strings.Join(errors, "; ")}
-	}
-
-	return HealthCheckResult{OK: true, Message: "no flannel routes to check (network not configured yet)"}
+	remaining := time.Until(l.Expiration)
+	return HealthCheckResult{OK: true, Message: fmt.Sprintf("lease valid, expires in %v", remaining.Round(time.Second))}
 }
 
 func mustRunHealthz(stopChan <-chan struct{}, wg *sync.WaitGroup) {
@@ -699,8 +666,9 @@ func mustRunHealthz(stopChan <-chan struct{}, wg *sync.WaitGroup) {
 			EtcdHealth    HealthCheckResult   `json:"etcdHealth"`
 			IfaceHealth   HealthCheckResult   `json:"interfaceHealth"`
 			RoutingHealth HealthCheckResult   `json:"routingHealth"`
+			LeaseHealth   HealthCheckResult   `json:"leaseHealth"`
 		}{
-			Status:      "running",
+			Status:      "initializing",
 			BackendType: healthzState.BackendType,
 			Network:     healthzState.Network,
 			Subnet:      healthzState.Subnet,
@@ -713,12 +681,7 @@ func mustRunHealthz(stopChan <-chan struct{}, wg *sync.WaitGroup) {
 		healthzState.mu.RUnlock()
 
 		state.EtcdHealth = checkEtcdConnectivity(r.Context(), sm)
-
-		if extIfaceName != "" {
-			state.IfaceHealth = checkNetworkInterface(extIfaceName)
-		} else {
-			state.IfaceHealth = HealthCheckResult{OK: false, Error: "external interface not yet initialized"}
-		}
+		state.IfaceHealth = checkNetworkInterface(extIfaceName, extIfaceIndex)
 
 		var networkStr, ipv6NetworkStr string
 		if config != nil {
@@ -729,17 +692,23 @@ func mustRunHealthz(stopChan <-chan struct{}, wg *sync.WaitGroup) {
 				ipv6NetworkStr = config.IPv6Network.String()
 			}
 		}
-		state.RoutingHealth = checkRoutingTable(networkStr, ipv6NetworkStr, extIfaceName, extIfaceIndex)
+		state.RoutingHealth = checkRoutingTable(networkStr, ipv6NetworkStr, extIfaceIndex)
 
-		overallOK := state.EtcdHealth.OK && state.IfaceHealth.OK && state.RoutingHealth.OK
-		if overallOK {
+		var currentLease *lease.Lease
+		if bn != nil {
+			currentLease = bn.Lease()
+		}
+		state.LeaseHealth = checkLease(currentLease)
+
+		allOK := state.EtcdHealth.OK && state.IfaceHealth.OK && state.RoutingHealth.OK && state.LeaseHealth.OK
+		if allOK {
 			state.Status = "healthy"
-		} else {
+		} else if state.EtcdHealth.OK || state.IfaceHealth.OK {
 			state.Status = "degraded"
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		if !overallOK {
+		if !allOK {
 			w.WriteHeader(http.StatusServiceUnavailable)
 		} else {
 			w.WriteHeader(http.StatusOK)

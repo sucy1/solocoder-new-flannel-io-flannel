@@ -400,28 +400,28 @@ func (dev *wgDevice) findPeerBySubnet(targetSubnet net.IPNet) (wgtypes.Key, bool
 	return wgtypes.Key{}, false
 }
 
-func (dev *wgDevice) swapPeer(publicEndpoint string, newPublicKeyRaw string, peerSubnets []net.IPNet) error {
-	oldPublicKey := wgtypes.Key{}
+func (dev *wgDevice) swapPeer(publicEndpoint string, newPublicKeyRaw string, peerSubnets []net.IPNet) (oldPublicKey string, changed bool, err error) {
+	oldPubKey := wgtypes.Key{}
 	foundOld := false
 	for _, subnet := range peerSubnets {
 		if pk, ok := dev.findPeerBySubnet(subnet); ok {
-			oldPublicKey = pk
+			oldPubKey = pk
 			foundOld = true
 			break
 		}
 	}
 
-	newPublicKey, err := wgtypes.ParseKey(newPublicKeyRaw)
+	newPubKey, err := wgtypes.ParseKey(newPublicKeyRaw)
 	if err != nil {
-		return fmt.Errorf("failed to parse new publicKey: %w", err)
+		return "", false, fmt.Errorf("failed to parse new publicKey: %w", err)
 	}
 
-	if foundOld && newPublicKey != oldPublicKey {
-		log.Infof("Detected peer public key change for subnet(s) %v, performing atomic swap (add new, remove old)", peerSubnets)
+	if foundOld && newPubKey != oldPubKey {
+		log.Infof("Detected peer public key change for subnet(s) %v, adding new peer first (overlap mode)", peerSubnets)
 
 		udpEndpoint, err := net.ResolveUDPAddr("udp", publicEndpoint)
 		if err != nil {
-			return fmt.Errorf("failed to resolve UDP address: %w", err)
+			return "", false, fmt.Errorf("failed to resolve UDP address: %w", err)
 		}
 
 		wgcfg := wgtypes.Config{
@@ -430,22 +430,18 @@ func (dev *wgDevice) swapPeer(publicEndpoint string, newPublicKeyRaw string, pee
 			ReplacePeers: false,
 			Peers: []wgtypes.PeerConfig{
 				{
-					PublicKey:                   newPublicKey,
+					PublicKey:                   newPubKey,
 					PresharedKey:                dev.attrs.psk,
 					PersistentKeepaliveInterval: dev.attrs.keepalive,
 					Endpoint:                    udpEndpoint,
-					ReplaceAllowedIPs:           true,
+					ReplaceAllowedIPs:           false,
 					AllowedIPs:                  peerSubnets,
-				},
-				{
-					PublicKey: oldPublicKey,
-					Remove:    true,
 				},
 			}}
 
 		client, err := wgctrl.New()
 		if err != nil {
-			return fmt.Errorf("failed to open wgctrl: %w", err)
+			return "", false, fmt.Errorf("failed to open wgctrl: %w", err)
 		}
 		defer func() {
 			err := client.Close()
@@ -456,12 +452,17 @@ func (dev *wgDevice) swapPeer(publicEndpoint string, newPublicKeyRaw string, pee
 
 		err = client.ConfigureDevice(dev.attrs.name, wgcfg)
 		if err != nil {
-			return fmt.Errorf("failed to configure device for peer swap: %w", err)
+			return "", false, fmt.Errorf("failed to add new peer during swap: %w", err)
 		}
 
-		log.Infof("Successfully swapped peer from %s to %s", oldPublicKey.String()[:12]+"...", newPublicKeyRaw[:12]+"...")
-		return nil
+		log.Infof("Added new peer %v for subnet(s) %v, old peer %v will be removed after overlap period",
+			newPublicKeyRaw[:12]+"...", peerSubnets, oldPubKey.String()[:12]+"...")
+		return oldPubKey.String(), true, nil
 	}
 
-	return dev.addPeer(publicEndpoint, newPublicKeyRaw, peerSubnets)
+	err = dev.addPeer(publicEndpoint, newPublicKeyRaw, peerSubnets)
+	if err != nil {
+		return "", false, err
+	}
+	return "", false, nil
 }

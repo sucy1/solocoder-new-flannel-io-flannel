@@ -41,28 +41,34 @@ const (
 		N-byte encrypted data
 		16-byte authentication tag
 	*/
-	overhead = 80
+	overhead            = 80
+	keyRotationOverlap  = 2 * time.Minute
 )
 
 type network struct {
-	dev      *wgDevice
-	v6Dev    *wgDevice
-	extIface *backend.ExternalInterface
-	mode     Mode
-	lease    *lease.Lease
-	sm       subnet.Manager
-	mtu      int
+	dev               *wgDevice
+	v6Dev             *wgDevice
+	extIface          *backend.ExternalInterface
+	mode              Mode
+	lease             *lease.Lease
+	sm                subnet.Manager
+	mtu               int
+	pendingRemovals   map[string]time.Time
+	pendingRemovalsV6 map[string]time.Time
+	removalMu         sync.Mutex
 }
 
 func newNetwork(sm subnet.Manager, extIface *backend.ExternalInterface, dev, v6Dev *wgDevice, mode Mode, lease *lease.Lease, mtu int) (*network, error) {
 	n := &network{
-		dev:      dev,
-		v6Dev:    v6Dev,
-		extIface: extIface,
-		mode:     mode,
-		lease:    lease,
-		sm:       sm,
-		mtu:      mtu,
+		dev:               dev,
+		v6Dev:             v6Dev,
+		extIface:          extIface,
+		mode:              mode,
+		lease:             lease,
+		sm:                sm,
+		mtu:               mtu,
+		pendingRemovals:   make(map[string]time.Time),
+		pendingRemovalsV6: make(map[string]time.Time),
 	}
 
 	return n, nil
@@ -92,6 +98,9 @@ func (n *network) Run(ctx context.Context) {
 	cleanupTicker := time.NewTicker(5 * time.Minute)
 	defer cleanupTicker.Stop()
 
+	pendingRemovalTicker := time.NewTicker(30 * time.Second)
+	defer pendingRemovalTicker.Stop()
+
 	for {
 		select {
 		case evtBatch := <-events:
@@ -100,8 +109,56 @@ func (n *network) Run(ctx context.Context) {
 		case <-cleanupTicker.C:
 			n.cleanupStalePeers(ctx)
 
+		case <-pendingRemovalTicker.C:
+			n.processPendingRemovals()
+
 		case <-ctx.Done():
 			return
+		}
+	}
+}
+
+func (n *network) schedulePeerRemoval(dev *wgDevice, pubKey string, isV6 bool) {
+	n.removalMu.Lock()
+	defer n.removalMu.Unlock()
+
+	removeAt := time.Now().Add(keyRotationOverlap)
+	if isV6 {
+		n.pendingRemovalsV6[pubKey] = removeAt
+	} else {
+		n.pendingRemovals[pubKey] = removeAt
+	}
+	log.Infof("Scheduled peer %s for removal at %v (overlap period %v)",
+		pubKey[:12]+"...", removeAt.Format(time.RFC3339), keyRotationOverlap)
+}
+
+func (n *network) processPendingRemovals() {
+	n.removalMu.Lock()
+	defer n.removalMu.Unlock()
+
+	now := time.Now()
+
+	for pubKey, removeAt := range n.pendingRemovals {
+		if now.After(removeAt) {
+			log.Infof("Removing old peer %s after overlap period", pubKey[:12]+"...")
+			if err := n.dev.removePeer(pubKey); err != nil {
+				log.Errorf("Failed to remove old peer %s: %v", pubKey[:12]+"...", err)
+			} else {
+				delete(n.pendingRemovals, pubKey)
+			}
+		}
+	}
+
+	if n.v6Dev != nil {
+		for pubKey, removeAt := range n.pendingRemovalsV6 {
+			if now.After(removeAt) {
+				log.Infof("Removing old v6 peer %s after overlap period", pubKey[:12]+"...")
+				if err := n.v6Dev.removePeer(pubKey); err != nil {
+					log.Errorf("Failed to remove old v6 peer %s: %v", pubKey[:12]+"...", err)
+				} else {
+					delete(n.pendingRemovalsV6, pubKey)
+				}
+			}
 		}
 	}
 }
@@ -265,11 +322,14 @@ func (n *network) handleSubnetEvents(ctx context.Context, batch []lease.Event) {
 			if n.mode == Separate {
 				if event.Lease.EnableIPv4 {
 					log.Infof("Subnet added: %v via %v", event.Lease.Subnet, v4PeerEndpoint)
-					if err := n.dev.swapPeer(
+					oldPubKey, changed, err := n.dev.swapPeer(
 						v4PeerEndpoint,
 						v4wireguardAttrs.PublicKey,
-						[]net.IPNet{*event.Lease.Subnet.ToIPNet()}); err != nil {
+						[]net.IPNet{*event.Lease.Subnet.ToIPNet()})
+					if err != nil {
 						log.Errorf("failed to setup ipv4 peer (%s): %v", v4wireguardAttrs.PublicKey, err)
+					} else if changed {
+						n.schedulePeerRemoval(n.dev, oldPubKey, false)
 					}
 					netconf, err := n.sm.GetNetworkConfig(ctx)
 					if err != nil {
@@ -283,11 +343,14 @@ func (n *network) handleSubnetEvents(ctx context.Context, batch []lease.Event) {
 
 				if event.Lease.EnableIPv6 {
 					log.Infof("Subnet added: %v via %v", event.Lease.IPv6Subnet, v6PeerEndpoint)
-					if err := n.v6Dev.swapPeer(
+					oldPubKey, changed, err := n.v6Dev.swapPeer(
 						v6PeerEndpoint,
 						v6wireguardAttrs.PublicKey,
-						[]net.IPNet{*event.Lease.IPv6Subnet.ToIPNet()}); err != nil {
+						[]net.IPNet{*event.Lease.IPv6Subnet.ToIPNet()})
+					if err != nil {
 						log.Errorf("failed to setup ipv6 peer (%s): %v", v6wireguardAttrs.PublicKey, err)
+					} else if changed {
+						n.schedulePeerRemoval(n.v6Dev, oldPubKey, true)
 					}
 					netconf, err := n.sm.GetNetworkConfig(ctx)
 					if err != nil {
@@ -316,11 +379,14 @@ func (n *network) handleSubnetEvents(ctx context.Context, batch []lease.Event) {
 				for _, v := range subnets {
 					peers = append(peers, *v)
 				}
-				if err := n.dev.swapPeer(
+				oldPubKey, changed, err := n.dev.swapPeer(
 					publicEndpoint,
 					wireguardAttrs.PublicKey,
-					peers); err != nil {
+					peers)
+				if err != nil {
 					log.Errorf("failed to setup peer (%s): %v", v4wireguardAttrs.PublicKey, err)
+				} else if changed {
+					n.schedulePeerRemoval(n.dev, oldPubKey, false)
 				}
 				netconf, err := n.sm.GetNetworkConfig(ctx)
 				if err != nil {
