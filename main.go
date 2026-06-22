@@ -27,6 +27,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"encoding/json"
 	"sync"
 	"syscall"
 	"time"
@@ -34,6 +35,7 @@ import (
 	"github.com/coreos/pkg/flagutil"
 	"github.com/flannel-io/flannel/pkg/ip"
 	"github.com/flannel-io/flannel/pkg/ipmatch"
+	"github.com/flannel-io/flannel/pkg/lease"
 	"github.com/flannel-io/flannel/pkg/subnet"
 	etcd "github.com/flannel-io/flannel/pkg/subnet/etcd"
 	"github.com/flannel-io/flannel/pkg/subnet/kube"
@@ -105,7 +107,20 @@ var (
 	errInterrupted = errors.New("interrupted")
 	errCanceled    = errors.New("canceled")
 	flannelFlags   = flag.NewFlagSet("flannel", flag.ExitOnError)
+	healthzState   = &HealthzState{}
 )
+
+type HealthzState struct {
+	mu          sync.RWMutex
+	BackendType string
+	Network     string
+	Subnet      string
+	IPv6Subnet  string
+	MTU         int
+	PublicIP    string
+	PublicIPv6  string
+	LeaseExpiry string
+}
 
 func init() {
 	flannelFlags.StringVar(&opts.etcdEndpoints, "etcd-endpoints", "http://127.0.0.1:4001,http://127.0.0.1:2379", "a comma-delimited list of etcd endpoints")
@@ -384,6 +399,25 @@ func main() {
 		os.Exit(1)
 	}
 
+	healthzState.mu.Lock()
+	healthzState.BackendType = config.BackendType
+	healthzState.Network = config.Network.String()
+	healthzState.MTU = bn.MTU()
+	if bn.Lease() != nil {
+		healthzState.Subnet = bn.Lease().Subnet.String()
+		healthzState.IPv6Subnet = bn.Lease().IPv6Subnet.String()
+		if !bn.Lease().Expiration.IsZero() {
+			healthzState.LeaseExpiry = bn.Lease().Expiration.Format(time.RFC3339)
+		}
+		if bn.Lease().Attrs.PublicIP != 0 {
+			healthzState.PublicIP = bn.Lease().Attrs.PublicIP.String()
+		}
+		if bn.Lease().Attrs.PublicIPv6 != nil {
+			healthzState.PublicIPv6 = bn.Lease().Attrs.PublicIPv6.String()
+		}
+	}
+	healthzState.mu.Unlock()
+
 	// Instanciate a TrafficManager to clean-up the rules of the backend we don't use
 	// This is to ensure a clean state in case flannel is restarted with a different choice
 	log.Info("Cleaning-up unused traffic manager rules")
@@ -547,16 +581,40 @@ func mustRunHealthz(stopChan <-chan struct{}, wg *sync.WaitGroup) {
 	address := net.JoinHostPort(opts.healthzIP, strconv.Itoa(opts.healthzPort))
 	log.Infof("Start healthz server on %s", address)
 
-	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		healthzState.mu.RLock()
+		state := struct {
+			Status      string `json:"status"`
+			BackendType string `json:"backendType,omitempty"`
+			Network     string `json:"network,omitempty"`
+			Subnet      string `json:"subnet,omitempty"`
+			IPv6Subnet  string `json:"ipv6Subnet,omitempty"`
+			MTU         int    `json:"mtu,omitempty"`
+			PublicIP    string `json:"publicIP,omitempty"`
+			PublicIPv6  string `json:"publicIPv6,omitempty"`
+			LeaseExpiry string `json:"leaseExpiry,omitempty"`
+		}{
+			Status:      "running",
+			BackendType: healthzState.BackendType,
+			Network:     healthzState.Network,
+			Subnet:      healthzState.Subnet,
+			IPv6Subnet:  healthzState.IPv6Subnet,
+			MTU:         healthzState.MTU,
+			PublicIP:    healthzState.PublicIP,
+			PublicIPv6:  healthzState.PublicIPv6,
+			LeaseExpiry: healthzState.LeaseExpiry,
+		}
+		healthzState.mu.RUnlock()
+
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, err := w.Write([]byte("flanneld is running"))
-		if err != nil {
+		if err := json.NewEncoder(w).Encode(state); err != nil {
 			log.Errorf("Handling /healthz error. %v", err)
-			panic(err)
 		}
 	})
 
-	server := &http.Server{Addr: address}
+	server := &http.Server{Addr: address, Handler: mux}
 
 	wg.Add(2)
 	go func() {

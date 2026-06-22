@@ -330,6 +330,35 @@ func AddBlackholeV6Route(ipV6Dest *net.IPNet) error {
 	return err
 }
 
+func DetectMinimumMTU() (int, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return 0, err
+	}
+
+	minMTU := 0
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagLoopback != 0 {
+			log.V(2).Infof("Skipping loopback interface %q", iface.Name)
+			continue
+		}
+		if iface.Flags&net.FlagUp == 0 {
+			log.V(2).Infof("Skipping down interface %q", iface.Name)
+			continue
+		}
+		log.V(2).Infof("Considering interface %q with MTU %d", iface.Name, iface.MTU)
+		if minMTU == 0 || iface.MTU < minMTU {
+			minMTU = iface.MTU
+		}
+	}
+
+	if minMTU == 0 {
+		return 0, errors.New("no valid interfaces found")
+	}
+
+	return minMTU, nil
+}
+
 // compareAddrs compares two netlink address in terms of which one should be used preferably.
 // Addresses which are supposed to be completely disregarded are not considered specially and should be filtered separately
 func compareAddrs(a, b netlink.Addr) int {

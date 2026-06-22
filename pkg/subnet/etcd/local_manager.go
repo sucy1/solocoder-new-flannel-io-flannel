@@ -359,9 +359,7 @@ func (m *LocalManager) WatchLeases(ctx context.Context, receiver chan []lease.Le
 	return nil
 }
 
-// CompleteLease monitor lease
 func (m *LocalManager) CompleteLease(ctx context.Context, myLease *lease.Lease, wg *sync.WaitGroup) error {
-	// Use the subnet manager to start watching leases.
 	evts := make(chan lease.Event)
 
 	wg.Add(1)
@@ -373,17 +371,42 @@ func (m *LocalManager) CompleteLease(ctx context.Context, myLease *lease.Lease, 
 
 	renewMargin := time.Duration(m.subnetLeaseRenewMargin) * time.Minute
 	dur := time.Until(myLease.Expiration) - renewMargin
+	renewFailures := 0
+	const maxRenewFailures = 3
 
 	for {
 		select {
 		case <-time.After(dur):
 			err := m.RenewLease(ctx, myLease)
 			if err != nil {
-				log.Error("Error renewing lease (trying again in 1 min): ", err)
+				renewFailures++
+				log.Errorf("Error renewing lease (attempt %d): %v", renewFailures, err)
+
+				if renewFailures >= maxRenewFailures {
+					log.Warning("Max renewal failures reached, attempting to release and re-acquire lease")
+					if rerr := m.registry.deleteSubnet(ctx, myLease.Subnet, myLease.IPv6Subnet); rerr != nil {
+						log.Errorf("Failed to release expired lease: %v", rerr)
+					}
+
+					newLease, aerr := m.AcquireLease(ctx, &myLease.Attrs)
+					if aerr != nil {
+						log.Errorf("Failed to re-acquire lease: %v", aerr)
+						dur = time.Minute
+						continue
+					}
+
+					*myLease = *newLease
+					renewFailures = 0
+					dur = time.Until(myLease.Expiration) - renewMargin
+					log.Infof("Successfully re-acquired lease: %v", myLease.Subnet)
+					continue
+				}
+
 				dur = time.Minute
 				continue
 			}
 
+			renewFailures = 0
 			log.Info("Lease renewed, new expiration: ", myLease.Expiration)
 			dur = time.Until(myLease.Expiration) - renewMargin
 
@@ -399,8 +422,17 @@ func (m *LocalManager) CompleteLease(ctx context.Context, myLease *lease.Lease, 
 				log.Infof("Waiting for %s to renew lease", dur)
 
 			case lease.EventRemoved:
-				log.Error("Lease has been revoked. Shutting down daemon.")
-				return errInterrupted
+				log.Warning("Lease has been revoked, attempting to release and re-acquire")
+				_ = m.registry.deleteSubnet(ctx, myLease.Subnet, myLease.IPv6Subnet)
+				newLease, aerr := m.AcquireLease(ctx, &myLease.Attrs)
+				if aerr != nil {
+					log.Errorf("Failed to re-acquire lease after revocation: %v", aerr)
+					return errInterrupted
+				}
+				*myLease = *newLease
+				renewFailures = 0
+				dur = time.Until(myLease.Expiration) - renewMargin
+				log.Infof("Successfully re-acquired lease after revocation: %v", myLease.Subnet)
 			}
 		}
 	}

@@ -24,6 +24,8 @@ import (
 	"sync"
 	"time"
 
+	log "k8s.io/klog/v2"
+
 	"github.com/flannel-io/flannel/pkg/backend"
 	"github.com/flannel-io/flannel/pkg/ip"
 	"github.com/flannel-io/flannel/pkg/lease"
@@ -119,10 +121,11 @@ func (be *WireguardBackend) RegisterNetwork(ctx context.Context, wg *sync.WaitGr
 		PSK                         string
 		PersistentKeepaliveInterval time.Duration
 		Mode                        Mode
+		Encryption                  *bool
 	}{
 		ListenPort:                  51820,
 		ListenPortV6:                51821,
-		MTU:                         be.extIface.Iface.MTU,
+		MTU:                         0,
 		PersistentKeepaliveInterval: 0,
 		Mode:                        Separate,
 	}
@@ -132,6 +135,21 @@ func (be *WireguardBackend) RegisterNetwork(ctx context.Context, wg *sync.WaitGr
 			return nil, fmt.Errorf("error decoding backend config: %w", err)
 		}
 	}
+
+	if cfg.MTU == 0 {
+		if minMTU, err := ip.DetectMinimumMTU(); err == nil {
+			cfg.MTU = minMTU
+			log.Infof("Wireguard MTU auto-detected: %d", cfg.MTU)
+		} else {
+			cfg.MTU = be.extIface.Iface.MTU
+			log.Infof("Wireguard MTU auto-detection failed, using interface MTU: %d", cfg.MTU)
+		}
+	}
+
+	if cfg.Encryption != nil && !*cfg.Encryption {
+		return nil, fmt.Errorf("wireguard backend cannot operate with Encryption=false; WireGuard is inherently encrypted")
+	}
+	log.Info("Wireguard encryption enabled")
 
 	keepalive := cfg.PersistentKeepaliveInterval * time.Second
 

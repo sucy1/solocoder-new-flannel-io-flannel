@@ -168,7 +168,7 @@ type VXLANConfig struct {
 func parseVXLANConfig(config json.RawMessage, defaultMTU int) (VXLANConfig, error) {
 	cfg := VXLANConfig{
 		VNI: defaultVNI,
-		MTU: defaultMTU,
+		MTU: 0,
 	}
 
 	if len(config) > 0 {
@@ -176,6 +176,17 @@ func parseVXLANConfig(config json.RawMessage, defaultMTU int) (VXLANConfig, erro
 			return VXLANConfig{}, err
 		}
 	}
+
+	if cfg.MTU == 0 {
+		if minMTU, err := ip.DetectMinimumMTU(); err == nil {
+			cfg.MTU = minMTU
+			log.Infof("VXLAN MTU auto-detected: %d", cfg.MTU)
+		} else {
+			cfg.MTU = defaultMTU
+			log.Infof("VXLAN MTU auto-detection failed, using interface MTU: %d", cfg.MTU)
+		}
+	}
+
 	return cfg, nil
 }
 

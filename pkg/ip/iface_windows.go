@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"net"
 
+	log "k8s.io/klog/v2"
+
 	"github.com/flannel-io/flannel/pkg/powershell"
 )
 
@@ -150,6 +152,35 @@ func IsForwardingEnabledForInterface(iface *net.Interface) (bool, error) {
 	}
 
 	return powerShellJsonData.Forwarding == 1, nil
+}
+
+func DetectMinimumMTU() (int, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return 0, err
+	}
+
+	minMTU := 0
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagLoopback != 0 {
+			log.V(2).Infof("Skipping loopback interface %q", iface.Name)
+			continue
+		}
+		if iface.Flags&net.FlagUp == 0 {
+			log.V(2).Infof("Skipping down interface %q", iface.Name)
+			continue
+		}
+		log.V(2).Infof("Considering interface %q with MTU %d", iface.Name, iface.MTU)
+		if minMTU == 0 || iface.MTU < minMTU {
+			minMTU = iface.MTU
+		}
+	}
+
+	if minMTU == 0 {
+		return 0, errors.New("no valid interfaces found")
+	}
+
+	return minMTU, nil
 }
 
 func GetInterfaceByIP6(ip net.IP) (*net.Interface, error)                       { return nil, nil }
